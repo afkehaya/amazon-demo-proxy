@@ -1,0 +1,14 @@
+{
+  "name": "amazon-demo-proxy",
+  "version": "1.0.0",
+  "description": "Simple Amazon proxy for testing x402 payments",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.2",
+    "express": "^4.18.0"
+  }
+}
