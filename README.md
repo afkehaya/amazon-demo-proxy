@@ -170,10 +170,15 @@ curl "http://localhost:8787/health/search" | jq
 
 ## 📊 Key Features
 
-### ✅ x402 Payment Protocol
+### ✅ x402 Payment Protocol (Recently Fixed!)
 - **HTTP 402 Payment Required** responses with structured payment instructions
+- **Proper header implementation**: Fixed critical headers (`Accept: x-solana-settlement`)
+- **USDC payment flow**: Resolved payment bypass issues that prevented USDC debiting
+- **Payment-first architecture**: Purchase requests now return 402 first, complete order after payment
 - **Fallback mechanism** ensures non-empty `accepts` arrays
 - **Enhanced debugging** with request ID tracking and comprehensive logging
+
+**🔧 Recent Fix**: The system now properly implements the x402 protocol by returning 402 Payment Required instead of immediately creating orders. This ensures USDC payments are properly processed through the Faremeter facilitator before order completion.
 
 ### ✅ Solana/USDC Integration
 - **Real blockchain transactions** via Crossmint API
@@ -242,7 +247,17 @@ if (payment.status === 402) {
 
 ### Common Issues
 
-1. **Empty x402 accepts array**
+1. **USDC not debited after purchase attempt** ⚠️ RESOLVED
+   ```bash
+   # This issue was caused by incorrect x402 protocol implementation
+   # The system was bypassing payment flow by creating orders immediately
+   #
+   # SOLUTION: Updated server.js to return 402 first, complete order after payment
+   # If you still see this issue, verify you have the latest commit:
+   git log --oneline -1  # Should show recent x402 fix commit
+   ```
+
+2. **Empty x402 accepts array**
    ```bash
    # Check payment proxy logs
    ./scripts/dev-suite.sh logs
