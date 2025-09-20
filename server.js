@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
+const { createExactPaymentResponse, getExactHeaders, assertExactSchemeOnly } = require('./src/payments/exact');
 
 // Environment validation
 function validateEnvironment() {
@@ -29,7 +30,7 @@ const app = express();
 const PORT = 8787;
 
 // Crossmint API configuration
-const CROSSMINT_API_KEY = 'sk_production_5TLaSkrBJJAnkhJZzhmoLdB1LS7GfwCw3w8owdffVN4i7zzEtBXwy6KTHFxh7SkvyNnE1vxPwqYXLM7B6di9Vuj1ZWT2iXqSvmXxwAcsTwCpUupZwRRx3zJDpbQjrUMpvTMkFZSDGbBYtLCpP1iii18NiCbnrf3rTbspkAQszDQvhv9UqZX7WiRSV6wcf6s594zxsxsTPooUjXTQaQKEz3fs';
+const CROSSMINT_API_KEY = process.env.CROSSMINT_API_KEY;
 const CROSSMINT_BASE_URL = 'https://www.crossmint.com/api/2022-06-09';
 
 // Product search via SerpAPI (like worldstore-agent)
@@ -37,6 +38,9 @@ const SERP_API_KEY = process.env.SERP_API_KEY;
 
 // Validate environment on startup
 validateEnvironment();
+
+// Assert exact scheme configuration
+assertExactSchemeOnly();
 
 // Load product catalog
 loadProductCatalog();
@@ -590,34 +594,29 @@ app.post('/purchase', async (req, res) => {
 
     console.log(`[Amazon Proxy] 💳 Returning 402 Payment Required for ${paymentId}, Amount: $${totalPrice}`);
 
-    // Return 402 Payment Required to trigger x402 payment flow
-    const paymentRequiredResponse = {
-      error: 'Payment Required',
-      message: `Payment of $${totalPrice} USDC required for ${product.title}`,
+    // Create exact payment response using the exact scheme builder
+    const paymentRequiredResponse = createExactPaymentResponse({
+      amount: totalPrice,
       paymentId,
-      amount: parseFloat(totalPrice),
-      currency: 'USDC',
       product: {
         asin: product.asin,
         title: product.title,
         price: product.price.amount,
         quantity
       }
-    };
+    });
 
     // Store in idempotency cache if key provided
     if (idempotencyKey) {
       storeIdempotencyResult(idempotencyKey, paymentRequiredResponse);
     }
 
-    // Set proper x402 headers for Faremeter protocol
-    res.set({
-      'Accept': 'x-solana-settlement',
-      'X-Payment-Amount': totalPrice,
-      'X-Payment-Currency': 'USDC',
-      'X-Payment-Id': paymentId,
-      'X-Payment-Schemes': 'x-solana-settlement'
+    // Set exact scheme headers for x402 protocol
+    const exactHeaders = getExactHeaders({
+      amount: totalPrice,
+      paymentId
     });
+    res.set(exactHeaders);
 
     res.status(402).json(paymentRequiredResponse);
 

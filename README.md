@@ -172,7 +172,7 @@ curl "http://localhost:8787/health/search" | jq
 
 ### ✅ x402 Payment Protocol (Recently Fixed!)
 - **HTTP 402 Payment Required** responses with structured payment instructions
-- **Proper header implementation**: Fixed critical headers (`Accept: x-solana-settlement`)
+- **Proper header implementation**: Fixed critical headers (`Accept: exact`)
 - **USDC payment flow**: Resolved payment bypass issues that prevented USDC debiting
 - **Payment-first architecture**: Purchase requests now return 402 first, complete order after payment
 - **Fallback mechanism** ensures non-empty `accepts` arrays
