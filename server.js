@@ -572,117 +572,54 @@ app.post('/purchase', async (req, res) => {
 
     console.log(`[Amazon Proxy] Processing purchase: ${paymentId}, Amount: $${totalPrice} for ${product.title}`);
 
-    // Create real Crossmint order using correct API format
-    console.log(`[Amazon Proxy] Creating Crossmint order for payment ${paymentId}`);
-
-    // Use shipping info if available, fallback to demo address
-    const recipientInfo = shipping || {
-      name: 'Demo Customer',
-      email: 'customer@example.com',
-      address: {
-        line1: '123 Test Street',
-        city: 'San Francisco',
-        state: 'CA',
-        postalCode: '94105',
-        country: 'US'
-      }
-    };
-
-    // Build product locator using validated ASIN
-    const productLocator = { asin: validatedAsin };
-    if (product.offerId) {
-      productLocator.offerId = product.offerId;
-    }
-
-    logAsinFlow(requestId, 'locator', {
-      productLocator,
-      sentToCrossmint: validatedAsin
-    });
-
-    console.log(`[Amazon Proxy] Product locator:`, productLocator);
-
-    // Crossmint physical products payload (no NFT-style fields)
-    const orderRequest = {
-      recipient: {
-        email: recipientInfo.email,
-        physicalAddress: {
-          name: recipientInfo.name,
-          line1: recipientInfo.address.line1,
-          line2: recipientInfo.address.line2 || '',
-          city: recipientInfo.address.city,
-          state: recipientInfo.address.state,
-          postalCode: recipientInfo.address.postalCode,
-          country: recipientInfo.address.country || 'US'
-        }
-      },
-      payment: {
-        method: 'solana',
-        currency: 'usdc'
-      },
-      lineItems: [
-        {
-          productLocator: toAmazonLocator(productLocator)
-        }
-      ]
-    };
-
-    console.log(`[Amazon Proxy] Sending Crossmint order request for payment ${paymentId}`);
-
-    const rawOrderData = await callCrossmintAPI('/orders', {
-      method: 'POST',
-      body: JSON.stringify(orderRequest)
-    });
-
-    // Validate and extract orderId from response
-    const { orderId, rawResponse } = validateCrossmintOrderResponse(rawOrderData);
-
-    console.log(`[Amazon Proxy] ✅ Real Amazon order created: ${orderId}`);
-
-    // Store order details
+    // Store payment details for later order creation after payment confirmation
     pendingPayments.set(paymentId, {
       asin: validatedAsin,
       originalAsin: product.asin,
       quantity,
       product: catalogProduct,
       totalPrice: parseFloat(totalPrice),
-      status: 'completed',
+      status: 'pending',
       createdAt: new Date(),
-      completedAt: new Date(),
-      crossmintOrder: orderId,
-      orderId: orderId,
-      trackingInfo: rawResponse.tracking,
       shipping: shipping || null,
-      rawCrossmintResponse: rawResponse
+      productBlob,
+      signature,
+      priceExpectation,
+      idempotencyKey
     });
 
-    // Create standardized success response
-    const successResponse = {
-      ok: true,
-      orderId: orderId,
-      status: 'confirmed',
-      message: 'Purchase completed successfully!',
-      order: {
-        orderId: orderId,
-        paymentId,
+    console.log(`[Amazon Proxy] 💳 Returning 402 Payment Required for ${paymentId}, Amount: $${totalPrice}`);
+
+    // Return 402 Payment Required to trigger x402 payment flow
+    const paymentRequiredResponse = {
+      error: 'Payment Required',
+      message: `Payment of $${totalPrice} USDC required for ${product.title}`,
+      paymentId,
+      amount: parseFloat(totalPrice),
+      currency: 'USDC',
+      product: {
         asin: product.asin,
-        product: product.title,
-        quantity,
-        unitPrice: product.price.amount,
-        totalPrice: parseFloat(totalPrice),
-        estimatedDelivery: '3-5 business days',
-        tracking: rawResponse.tracking || `TK${Date.now()}`
-      },
-      raw: rawResponse
+        title: product.title,
+        price: product.price.amount,
+        quantity
+      }
     };
 
     // Store in idempotency cache if key provided
     if (idempotencyKey) {
-      storeIdempotencyResult(idempotencyKey, successResponse);
+      storeIdempotencyResult(idempotencyKey, paymentRequiredResponse);
     }
 
-    console.log(`[Amazon Proxy] ✅ Purchase completed: ${orderId} (Request: ${requestId})`);
+    // Set proper x402 headers for Faremeter protocol
+    res.set({
+      'Accept': 'x-solana-settlement',
+      'X-Payment-Amount': totalPrice,
+      'X-Payment-Currency': 'USDC',
+      'X-Payment-Id': paymentId,
+      'X-Payment-Schemes': 'x-solana-settlement'
+    });
 
-    res.json(successResponse);
+    res.status(402).json(paymentRequiredResponse);
 
   } catch (error) {
     console.error(`[Amazon Proxy] Purchase failed (${requestId}):`, error.message);
@@ -781,7 +718,7 @@ app.post('/payment-webhook', async (req, res) => {
             },
             lineItems: [
               {
-                productLocator: toAmazonLocator(payment.product || { asin: payment.asin })
+                productLocator: toAmazonLocator({ asin: payment.asin })
               }
             ]
           };
