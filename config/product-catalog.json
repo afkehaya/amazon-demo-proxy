@@ -1,0 +1,29 @@
+{
+  "defaultASIN": "B08C7KG5LP",
+  "products": [
+    {
+      "asin": "B08C7KG5LP",
+      "name": "Apple AirPods (3rd Generation)",
+      "sku": "B08C7KG5LP",
+      "price": 169.99
+    },
+    {
+      "asin": "B01MTB55WH",
+      "name": "Apple AirPods (3rd Gen - Alt Listing)",
+      "sku": "B01MTB55WH",
+      "price": 169.99
+    },
+    {
+      "asin": "B0D9FLMR6N",
+      "name": "Real Amazon Product Test",
+      "sku": "B0D9FLMR6N",
+      "price": 29.99
+    },
+    {
+      "asin": "B01MFZF4VG",
+      "name": "Anker Soundcore 2 Portable Bluetooth Speaker",
+      "sku": "B01MFZF4VG",
+      "price": 39.99
+    }
+  ]
+}

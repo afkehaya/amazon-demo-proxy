@@ -1,10 +1,13 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
 // Environment validation
 function validateEnvironment() {
-  const required = ['SERP_API_KEY'];
+  const required = ['SERP_API_KEY', 'PRODUCT_SIGNING_SECRET'];
   const missing = required.filter(key => !process.env[key]);
 
   if (missing.length > 0) {
@@ -16,6 +19,7 @@ function validateEnvironment() {
   // Configuration summary (mask secrets)
   console.log('📋 Configuration Summary:');
   console.log(`   • SERP_API_KEY: ${process.env.SERP_API_KEY ? '***' + process.env.SERP_API_KEY.slice(-6) : 'NOT SET'}`);
+  console.log(`   • PRODUCT_SIGNING_SECRET: ${process.env.PRODUCT_SIGNING_SECRET ? '***' + process.env.PRODUCT_SIGNING_SECRET.slice(-6) : 'NOT SET'}`);
   console.log(`   • CROSSMINT_API_KEY: ${'***' + CROSSMINT_API_KEY.slice(-6)}`);
   console.log(`   • CROSSMINT_BASE_URL: ${CROSSMINT_BASE_URL}`);
   console.log('');
@@ -34,12 +38,163 @@ const SERP_API_KEY = process.env.SERP_API_KEY;
 // Validate environment on startup
 validateEnvironment();
 
+// Load product catalog
+loadProductCatalog();
+
 // Enable CORS and JSON parsing
 app.use(cors());
 app.use(express.json());
 
 // Store payment states (in-memory for demo)
 const pendingPayments = new Map();
+
+// Store idempotency keys with TTL (1 hour)
+const idempotencyCache = new Map();
+
+// Product catalog management
+var productCatalog = null;
+
+function loadProductCatalog() {
+  try {
+    const catalogPath = path.join(__dirname, 'config', 'product-catalog.json');
+    const catalogData = fs.readFileSync(catalogPath, 'utf8');
+    productCatalog = JSON.parse(catalogData);
+    console.log(`📦 Product catalog loaded: ${productCatalog.products.length} products`);
+    return productCatalog;
+  } catch (error) {
+    console.error('❌ Failed to load product catalog:', error.message);
+    // Fallback catalog
+    productCatalog = {
+      defaultASIN: "B08C7KG5LP",
+      products: [
+        { asin: "B08C7KG5LP", name: "Apple AirPods (3rd Generation)", sku: "B08C7KG5LP", price: 169.99 },
+        { asin: "B01MTB55WH", name: "Apple AirPods (3rd Gen - Alt Listing)", sku: "B01MTB55WH", price: 169.99 }
+      ]
+    };
+    console.log('📦 Using fallback product catalog');
+    return productCatalog;
+  }
+}
+
+function validateAsin(asin) {
+  if (!productCatalog) {
+    loadProductCatalog();
+  }
+
+  if (!asin) {
+    return {
+      valid: true,
+      asin: productCatalog.defaultASIN,
+      product: productCatalog.products.find(p => p.asin === productCatalog.defaultASIN),
+      reason: 'used_default'
+    };
+  }
+
+  const product = productCatalog.products.find(p => p.asin === asin);
+  if (product) {
+    return {
+      valid: true,
+      asin: asin,
+      product: product,
+      reason: 'found_in_catalog'
+    };
+  }
+
+  return {
+    valid: false,
+    asin: asin,
+    product: null,
+    reason: 'not_in_catalog',
+    suggestions: productCatalog.products.map(p => p.asin).slice(0, 3)
+  };
+}
+
+function logAsinFlow(requestId, stage, data) {
+  console.log(`[ASIN-Flow] ${requestId} ${stage}:`, data);
+}
+
+// Crypto utilities for stateless product signing
+function base64urlEncode(buffer) {
+  return buffer.toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
+}
+
+function base64urlDecode(str) {
+  // Add padding if needed
+  str += '='.repeat((4 - str.length % 4) % 4);
+  // Convert URL-safe base64 to standard base64
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  return Buffer.from(str, 'base64');
+}
+
+function signProduct(product) {
+  const productBlob = base64urlEncode(Buffer.from(JSON.stringify(product)));
+  const signature = crypto.createHmac('sha256', process.env.PRODUCT_SIGNING_SECRET)
+    .update(productBlob)
+    .digest('hex');
+
+  return { productBlob, signature };
+}
+
+function verifyProductSignature(productBlob, signature) {
+  const expectedSignature = crypto.createHmac('sha256', process.env.PRODUCT_SIGNING_SECRET)
+    .update(productBlob)
+    .digest('hex');
+
+  return crypto.timingSafeEqual(
+    Buffer.from(signature, 'hex'),
+    Buffer.from(expectedSignature, 'hex')
+  );
+}
+
+function decodeProduct(productBlob) {
+  try {
+    const productJson = base64urlDecode(productBlob).toString('utf8');
+    return JSON.parse(productJson);
+  } catch (error) {
+    throw new Error('Invalid product blob format');
+  }
+}
+
+// Amazon locator helper function
+function toAmazonLocator(p) {
+  if (p.asin) return `amazon:${p.asin}`;
+  if (p.url) return `amazon:${p.url}`;
+  throw new Error("No ASIN or URL for productLocator");
+}
+
+// Idempotency utilities
+function checkIdempotency(key) {
+  const existing = idempotencyCache.get(key);
+  if (existing) {
+    // Check if still valid (1 hour TTL)
+    if (Date.now() - existing.timestamp < 3600000) {
+      return existing.result;
+    } else {
+      idempotencyCache.delete(key);
+    }
+  }
+  return null;
+}
+
+function storeIdempotencyResult(key, result) {
+  idempotencyCache.set(key, {
+    result,
+    timestamp: Date.now()
+  });
+}
+
+// Clean up expired idempotency entries every 30 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of idempotencyCache.entries()) {
+    if (now - value.timestamp >= 3600000) {
+      idempotencyCache.delete(key);
+    }
+  }
+}, 1800000);
 
 // Helper function to call Crossmint API with structured logging
 async function callCrossmintAPI(endpoint, options = {}) {
@@ -152,25 +307,39 @@ async function searchAmazonProducts(query, limit = 10) {
       return [];
     }
 
-    const products = data.organic_results.map(item => ({
-      asin: item.asin,
-      title: item.title,
-      price: item.extracted_price || 0,
-      description: item.snippet || item.title,
-      image: item.thumbnail || '',
-      category: 'Electronics',
-      rating: item.rating || 4.0,
-      reviews: item.reviews || 0,
-      url: item.link_clean || `https://amazon.com/dp/${item.asin}`
-    })).slice(0, limit);
+    const products = data.organic_results.map(item => {
+      // Normalize to the required Product type
+      const product = {
+        asin: item.asin,
+        title: item.title,
+        url: item.link_clean || `https://amazon.com/dp/${item.asin}`,
+        image: item.thumbnail || '',
+        price: {
+          amount: item.extracted_price || 0,
+          currency: "USD"
+        },
+        offerId: item.offer_id || null,
+        meta: {
+          source: "serpapi",
+          fetchedAt: new Date().toISOString()
+        }
+      };
+
+      return product;
+    }).slice(0, limit);
 
     console.log(`[Amazon Proxy] Found ${products.length} real Amazon products via SerpAPI`);
 
-    // Cache products for later purchase
-    products.forEach(product => {
+    // Cache products for later purchase and return signed data
+    return products.map(product => {
       productCache.set(product.asin, product);
+      const { productBlob, signature } = signProduct(product);
+      return {
+        product,
+        productBlob,
+        signature
+      };
     });
-    return products;
 
   } catch (error) {
     console.error('[Amazon Proxy] SerpAPI search failed:', error.message);
@@ -191,14 +360,14 @@ app.get('/products', async (req, res) => {
     }
 
     // Use SerpAPI for real search only - no fallbacks
-    const products = await searchAmazonProducts(search, parseInt(limit));
+    const signedProducts = await searchAmazonProducts(search, parseInt(limit));
 
     res.json({
-      products,
-      count: products.length,
+      products: signedProducts,
+      count: signedProducts.length,
       searchMethod: 'SerpAPI Production',
       query: search,
-      note: 'Real Amazon products ready for Crossmint order fulfillment'
+      note: 'Real Amazon products with HMAC signatures for stateless flow'
     });
   } catch (error) {
     console.error('[Amazon Proxy] Search error:', error);
@@ -210,45 +379,141 @@ app.get('/products', async (req, res) => {
   }
 });
 
-// Purchase endpoint - processes orders after payment confirmation
+// Standardized error response function
+function createErrorResponse(stage, code, message, details = {}) {
+  return {
+    ok: false,
+    stage,
+    code,
+    message,
+    details: {
+      ...details,
+      timestamp: new Date().toISOString()
+    }
+  };
+}
+
+// Purchase endpoint - stateless flow with HMAC verification
 app.post('/purchase', async (req, res) => {
-  const { sku, quantity = 1, shipping } = req.body;
+  const {
+    productBlob,
+    signature,
+    quantity = 1,
+    shipping,
+    idempotencyKey,
+    priceExpectation
+  } = req.body;
+
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
   // Log incoming request body (sanitized)
-  console.log(`[Amazon Proxy] Purchase request received:`, {
-    sku,
+  console.log(`[Amazon Proxy] Purchase request received (${requestId}):`, {
+    hasProductBlob: !!productBlob,
+    hasSignature: !!signature,
     quantity,
-    shipping: shipping ? {
-      name: shipping.name,
-      email: shipping.email,
-      address: shipping.address
-    } : null
+    hasShipping: !!shipping,
+    idempotencyKey,
+    hasPriceExpectation: !!priceExpectation
   });
 
-  if (!sku) {
-    return res.status(400).json({ error: 'SKU/ASIN is required' });
+  // Validate required fields
+  if (!productBlob || !signature) {
+    return res.status(400).json(createErrorResponse(
+      'validation',
+      'MISSING_REQUIRED_FIELDS',
+      'productBlob and signature are required',
+      { requestId, missing: !productBlob ? ['productBlob'] : ['signature'] }
+    ));
+  }
+
+  // Check idempotency
+  if (idempotencyKey) {
+    const existingResult = checkIdempotency(idempotencyKey);
+    if (existingResult) {
+      console.log(`[Amazon Proxy] Returning cached result for idempotency key: ${idempotencyKey}`);
+      return res.json(existingResult);
+    }
   }
 
   try {
-    // For production, we need to fetch product details from cache or search again
-    // Since we don't have a persistent product catalog, we'll create a minimal product object
-    // This assumes the SKU/ASIN was obtained from a recent search
-    let product = productCache.get(sku);
-
-    if (!product) {
-      // If not in cache, create minimal product data for Crossmint
-      // In production, you'd validate this ASIN exists on Amazon
-      product = {
-        asin: sku,
-        title: `Amazon Product ${sku}`,
-        price: 29.99, // Default price - in real system would fetch from Amazon
-        description: `Product with ASIN ${sku}`,
-        category: 'General'
-      };
-      console.log(`[Amazon Proxy] Using fallback product data for ASIN ${sku}`);
+    // Step 1: Verify HMAC signature
+    if (!verifyProductSignature(productBlob, signature)) {
+      return res.status(400).json(createErrorResponse(
+        'auth',
+        'INVALID_SIGNATURE',
+        'Product signature verification failed',
+        { requestId }
+      ));
     }
 
-    const totalPrice = (product.price * quantity).toFixed(2);
+    // Step 2: Decode and validate product data
+    let product;
+    try {
+      product = decodeProduct(productBlob);
+    } catch (error) {
+      return res.status(400).json(createErrorResponse(
+        'validation',
+        'INVALID_PRODUCT_BLOB',
+        'Failed to decode product data: ' + error.message,
+        { requestId }
+      ));
+    }
+
+    logAsinFlow(requestId, 'incoming', {
+      asin: product.asin,
+      title: product.title,
+      source: 'decoded_product'
+    });
+
+    // Step 3: ASIN validation against product catalog
+    const asinValidation = validateAsin(product.asin);
+    logAsinFlow(requestId, 'validation', asinValidation);
+
+    if (!asinValidation.valid) {
+      return res.status(400).json(createErrorResponse(
+        'catalog.validate',
+        'ASIN_NOT_IN_CATALOG',
+        `ASIN ${product.asin} is not in the approved product catalog`,
+        {
+          requestId,
+          providedAsin: product.asin,
+          suggestions: asinValidation.suggestions,
+          availableAsins: productCatalog.products.map(p => p.asin)
+        }
+      ));
+    }
+
+    // Use validated ASIN (might be different if defaulted)
+    const validatedAsin = asinValidation.asin;
+    const catalogProduct = asinValidation.product;
+
+    logAsinFlow(requestId, 'validated', {
+      originalAsin: product.asin,
+      validatedAsin: validatedAsin,
+      catalogProduct: catalogProduct.name,
+      reason: asinValidation.reason
+    });
+
+    console.log(`[Amazon Proxy] Processing purchase for ASIN: ${validatedAsin}, Title: ${catalogProduct.name} (${asinValidation.reason})`);
+
+    // Step 4: Optional price validation (if priceExpectation provided)
+    if (priceExpectation && product.price.amount > priceExpectation.amount) {
+      return res.status(400).json(createErrorResponse(
+        'sku.validate',
+        'PRICE_EXCEEDED',
+        `Current price $${product.price.amount} exceeds expected price $${priceExpectation.amount}`,
+        {
+          requestId,
+          currentPrice: product.price.amount,
+          expectedPrice: priceExpectation.amount
+        }
+      ));
+    }
+
+    // Step 4: Optional re-lookup for price validation (safer but requires additional API call)
+    // For now, we'll skip this since it requires another SerpAPI call per purchase
+
+    const totalPrice = (product.price.amount * quantity).toFixed(2);
     const paymentId = `payment_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
     console.log(`[Amazon Proxy] Processing purchase: ${paymentId}, Amount: $${totalPrice} for ${product.title}`);
@@ -269,50 +534,42 @@ app.post('/purchase', async (req, res) => {
       }
     };
 
-    // Build product locator with fallback logic: prefer ASIN, then URL
-    let productLocator;
-    if (product.asin) {
-      // Try the simplest format first: just the ASIN string
-      productLocator = `amazon:${product.asin}`;
-    } else if (product.url) {
-      // Fallback to URL-based locator
-      productLocator = product.url;
-    } else {
-      throw new Error(`Missing ASIN/URL for product ${sku}. Cannot create Crossmint order.`);
+    // Build product locator using validated ASIN
+    const productLocator = { asin: validatedAsin };
+    if (product.offerId) {
+      productLocator.offerId = product.offerId;
     }
+
+    logAsinFlow(requestId, 'locator', {
+      productLocator,
+      sentToCrossmint: validatedAsin
+    });
 
     console.log(`[Amazon Proxy] Product locator:`, productLocator);
 
+    // Crossmint physical products payload (no NFT-style fields)
     const orderRequest = {
       recipient: {
-        email: recipientInfo.email
-      },
-      shipping: {
-        name: recipientInfo.name,
-        addressLine1: recipientInfo.address.line1,
-        addressLine2: recipientInfo.address.line2 || '',
-        city: recipientInfo.address.city,
-        state: recipientInfo.address.state,
-        postalCode: recipientInfo.address.postalCode,
-        country: recipientInfo.address.country || 'US'
+        email: recipientInfo.email,
+        physicalAddress: {
+          name: recipientInfo.name,
+          line1: recipientInfo.address.line1,
+          line2: recipientInfo.address.line2 || '',
+          city: recipientInfo.address.city,
+          state: recipientInfo.address.state,
+          postalCode: recipientInfo.address.postalCode,
+          country: recipientInfo.address.country || 'US'
+        }
       },
       payment: {
-        method: 'solana', // Mainnet Solana
+        method: 'solana',
         currency: 'usdc'
       },
       lineItems: [
         {
-          productLocator,
-          quantity: quantity,
-          name: product.title || `Amazon Product ${product.asin}`,
-          description: product.description || product.title,
-          price: {
-            amount: Math.round(product.price * 100), // Convert to cents
-            currency: 'USD'
-          }
+          productLocator: toAmazonLocator(productLocator)
         }
-      ],
-      locale: 'en-US'
+      ]
     };
 
     console.log(`[Amazon Proxy] Sending Crossmint order request for payment ${paymentId}`);
@@ -329,10 +586,10 @@ app.post('/purchase', async (req, res) => {
 
     // Store order details
     pendingPayments.set(paymentId, {
-      sku,
-      asin: product.asin,
+      asin: validatedAsin,
+      originalAsin: product.asin,
       quantity,
-      product,
+      product: catalogProduct,
       totalPrice: parseFloat(totalPrice),
       status: 'completed',
       createdAt: new Date(),
@@ -344,8 +601,8 @@ app.post('/purchase', async (req, res) => {
       rawCrossmintResponse: rawResponse
     });
 
-    // Return standardized success response
-    res.json({
+    // Create standardized success response
+    const successResponse = {
       ok: true,
       orderId: orderId,
       status: 'confirmed',
@@ -353,48 +610,65 @@ app.post('/purchase', async (req, res) => {
       order: {
         orderId: orderId,
         paymentId,
-        sku,
+        asin: product.asin,
         product: product.title,
         quantity,
-        unitPrice: product.price,
+        unitPrice: product.price.amount,
         totalPrice: parseFloat(totalPrice),
         estimatedDelivery: '3-5 business days',
         tracking: rawResponse.tracking || `TK${Date.now()}`
       },
       raw: rawResponse
-    });
+    };
+
+    // Store in idempotency cache if key provided
+    if (idempotencyKey) {
+      storeIdempotencyResult(idempotencyKey, successResponse);
+    }
+
+    console.log(`[Amazon Proxy] ✅ Purchase completed: ${orderId} (Request: ${requestId})`);
+
+    res.json(successResponse);
 
   } catch (error) {
-    console.error('[Amazon Proxy] Purchase failed:', error.message);
-    console.error('[Amazon Proxy] Error details:', error);
+    console.error(`[Amazon Proxy] Purchase failed (${requestId}):`, error.message);
+    console.error(`[Amazon Proxy] Error details (${requestId}):`, error);
 
     // Determine error stage and provide structured response
     let stage = 'unknown';
-    let code = 500;
+    let code = 'INTERNAL_ERROR';
+    let statusCode = 500;
 
     if (error.message.includes('Crossmint API error')) {
       stage = 'crossmint.createOrder';
-      code = 502; // Bad Gateway - upstream API error
-    } else if (error.message.includes('Missing ASIN/URL')) {
-      stage = 'product.locator';
-      code = 400; // Bad Request - missing required data
+      code = 'CROSSMINT_API_ERROR';
+      statusCode = 502; // Bad Gateway - upstream API error
     } else if (error.message.includes('Invalid Crossmint response')) {
       stage = 'crossmint.validation';
-      code = 502; // Bad Gateway - malformed response
+      code = 'CROSSMINT_INVALID_RESPONSE';
+      statusCode = 502; // Bad Gateway - malformed response
+    } else if (error.message.includes('Product signature verification failed')) {
+      stage = 'auth';
+      code = 'INVALID_SIGNATURE';
+      statusCode = 400;
+    } else if (error.message.includes('Invalid product blob')) {
+      stage = 'validation';
+      code = 'INVALID_PRODUCT_BLOB';
+      statusCode = 400;
     }
 
-    // Return standardized error response
-    res.status(code).json({
-      ok: false,
-      stage: stage,
-      code: code,
-      message: error.message,
-      details: {
-        originalError: error.message,
-        timestamp: new Date().toISOString(),
-        requestId: `req_${Date.now()}`
-      }
+    // Create error response with idempotency support
+    const errorResponse = createErrorResponse(stage, code, error.message, {
+      requestId,
+      originalError: error.message
     });
+
+    // Store error in idempotency cache if key provided
+    if (idempotencyKey) {
+      storeIdempotencyResult(idempotencyKey, errorResponse);
+    }
+
+    res.status(statusCode).json(errorResponse);
   }
 });
 
@@ -433,30 +707,29 @@ app.post('/payment-webhook', async (req, res) => {
             }
           };
 
+          // Crossmint physical products payload (no NFT-style fields)
           const orderRequest = {
             recipient: {
-              email: recipientInfo.email
-            },
-            shipping: {
-              name: recipientInfo.name,
-              addressLine1: recipientInfo.address.line1,
-              addressLine2: recipientInfo.address.line2 || '',
-              city: recipientInfo.address.city,
-              state: recipientInfo.address.state,
-              postalCode: recipientInfo.address.postalCode,
-              country: recipientInfo.address.country || 'US'
+              email: recipientInfo.email,
+              physicalAddress: {
+                name: recipientInfo.name,
+                line1: recipientInfo.address.line1,
+                line2: recipientInfo.address.line2 || '',
+                city: recipientInfo.address.city,
+                state: recipientInfo.address.state,
+                postalCode: recipientInfo.address.postalCode,
+                country: recipientInfo.address.country || 'US'
+              }
             },
             payment: {
-              method: 'solana', // Mainnet Solana
+              method: 'solana',
               currency: 'usdc'
             },
             lineItems: [
               {
-                productLocator: `amazon:${payment.asin}`,
-                quantity: payment.quantity
+                productLocator: toAmazonLocator(payment.product || { asin: payment.asin })
               }
-            ],
-            locale: 'en-US'
+            ]
           };
 
           const orderData = await callCrossmintAPI('/orders', {
@@ -559,6 +832,45 @@ app.post('/purchase-retry', (req, res) => {
       tracking: `TK${Date.now()}`
     },
     demo_note: 'This is a simulated purchase - no real products will be shipped!'
+  });
+});
+
+// Health endpoint for search functionality
+app.get('/health/search', (req, res) => {
+  const serpConfigured = !!SERP_API_KEY;
+
+  res.json({
+    serpConfigured,
+    note: serpConfigured ? 'SERP API key configured' : 'SERP API key missing - using demo products'
+  });
+});
+
+// Diagnostics endpoint
+app.get('/diagnostics', (req, res) => {
+  const lastPurchaseAsin = Array.from(pendingPayments.values())
+    .sort((a, b) => b.createdAt - a.createdAt)[0]?.asin || null;
+
+  // Simple Crossmint connectivity check
+  let crossmintReachable = true;
+  try {
+    // This is a basic check - in production you might want to do an actual API call
+    new URL(CROSSMINT_BASE_URL);
+  } catch {
+    crossmintReachable = false;
+  }
+
+  res.json({
+    serpConfigured: !!SERP_API_KEY,
+    productCatalogCount: productCatalog?.products?.length || 0,
+    lastPurchaseASIN: lastPurchaseAsin,
+    crossmintReachable,
+    activePayments: pendingPayments.size,
+    environment: {
+      nodeVersion: process.version,
+      platform: process.platform,
+      uptime: process.uptime()
+    },
+    availableASINs: productCatalog?.products?.map(p => p.asin) || []
   });
 });
 
