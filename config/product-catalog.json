@@ -1,5 +1,6 @@
 {
   "defaultASIN": "B08C7KG5LP",
+  "allowSerpProducts": true,
   "products": [
     {
       "asin": "B08C7KG5LP",
@@ -24,6 +25,18 @@
       "name": "Anker Soundcore 2 Portable Bluetooth Speaker",
       "sku": "B01MFZF4VG",
       "price": 39.99
+    },
+    {
+      "asin": "B071JM699B",
+      "name": "Amazon Basics Woodcased Classroom 2 Pencils with Erasers",
+      "sku": "B071JM699B",
+      "price": 4.59
+    },
+    {
+      "asin": "B0FQFB8FMG",
+      "name": "Apple AirPods Pro 3",
+      "sku": "B0FQFB8FMG",
+      "price": 269.00
     }
   ]
 }

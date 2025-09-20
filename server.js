@@ -76,7 +76,7 @@ function loadProductCatalog() {
   }
 }
 
-function validateAsin(asin) {
+function validateAsin(asin, productFromSerp = null) {
   if (!productCatalog) {
     loadProductCatalog();
   }
@@ -90,13 +90,67 @@ function validateAsin(asin) {
     };
   }
 
-  const product = productCatalog.products.find(p => p.asin === asin);
-  if (product) {
+  // First check if it's in our catalog
+  const catalogProduct = productCatalog.products.find(p => p.asin === asin);
+  if (catalogProduct) {
     return {
       valid: true,
       asin: asin,
-      product: product,
+      product: catalogProduct,
       reason: 'found_in_catalog'
+    };
+  }
+
+  // If allowSerpProducts is enabled and we have product data from SERP, allow it
+  if (productCatalog.allowSerpProducts && productFromSerp) {
+    // Convert SERP product format to our catalog format
+    const serpProduct = {
+      asin: productFromSerp.asin,
+      name: productFromSerp.title,
+      sku: productFromSerp.asin,
+      price: productFromSerp.price?.amount || 0
+    };
+
+    return {
+      valid: true,
+      asin: asin,
+      product: serpProduct,
+      reason: 'found_via_serp'
+    };
+  }
+
+  // If we have any ASIN that looks valid and SERP products are allowed, accept it
+  // This covers cases where we have cached products or products from search
+  if (productCatalog.allowSerpProducts && asin && asin.match(/^B[0-9A-Z]{9}$/)) {
+    const cachedProduct = productCache.get(asin);
+    if (cachedProduct) {
+      const serpProduct = {
+        asin: cachedProduct.asin,
+        name: cachedProduct.title,
+        sku: cachedProduct.asin,
+        price: cachedProduct.price?.amount || 0
+      };
+
+      return {
+        valid: true,
+        asin: asin,
+        product: serpProduct,
+        reason: 'found_in_cache'
+      };
+    }
+
+    // If allowSerpProducts is true, allow any valid-looking ASIN
+    // Crossmint will validate if it's actually purchasable
+    return {
+      valid: true,
+      asin: asin,
+      product: {
+        asin: asin,
+        name: `Amazon Product ${asin}`,
+        sku: asin,
+        price: 0 // Price will be determined by Crossmint
+      },
+      reason: 'serp_products_allowed'
     };
   }
 
@@ -239,7 +293,7 @@ function validateCrossmintOrderResponse(data) {
   }
 
   // Check for orderId or id field
-  const orderId = data.orderId || data.id || data.order_id;
+  const orderId = data.orderId || data.id || data.order_id || (data.order && data.order.orderId);
   if (!orderId) {
     throw new Error(`Invalid Crossmint response: missing order identifier. Response structure: ${JSON.stringify(Object.keys(data))}`);
   }
@@ -465,8 +519,8 @@ app.post('/purchase', async (req, res) => {
       source: 'decoded_product'
     });
 
-    // Step 3: ASIN validation against product catalog
-    const asinValidation = validateAsin(product.asin);
+    // Step 3: ASIN validation against product catalog (pass product data from SERP)
+    const asinValidation = validateAsin(product.asin, product);
     logAsinFlow(requestId, 'validation', asinValidation);
 
     if (!asinValidation.valid) {
